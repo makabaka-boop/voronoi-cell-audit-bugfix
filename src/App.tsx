@@ -12,6 +12,7 @@ import {
   fractionToRounded,
   fractionToString,
   nearestSite,
+  pointToString,
   toValidConfig,
   validateConfig,
 } from './geometry';
@@ -99,7 +100,7 @@ export default function App() {
     Math.max(lo, Math.min(hi, Math.round(v)));
 
   function onCanvasPointerDown(e: React.PointerEvent) {
-    if (e.target !== e.currentTarget) return; // 点到站点标记交给标记处理
+    // 多边形/边线不拦截事件，点击画布任意位置（含单元内部）都能查询
     setQuery(toLogical(e.clientX, e.clientY));
     setSelectedId(null);
   }
@@ -114,13 +115,11 @@ export default function App() {
 
   function onPointerMove(e: React.PointerEvent) {
     if (!dragId) return;
-    const svg = svgRef.current;
-    if (!svg) return;
-    const ctm = svg.getScreenCTM();
-    if (!ctm) return;
-    const loc = { x: e.clientX, y: e.clientY };
-    const nx = clampInt(loc.x, 0, width);
-    const ny = clampInt(loc.y, 0, height);
+    // 必须经 getScreenCTM().inverse() 还原到 viewBox 逻辑坐标，
+    // 否则画布缩放/窗口尺寸变化会改变站点落点
+    const p = toLogical(e.clientX, e.clientY);
+    const nx = clampInt(fractionToNumber(p.x), 0, width);
+    const ny = clampInt(fractionToNumber(p.y), 0, height);
     setSites((prev) => {
       const target = prev.find((s) => s.id === dragId);
       if (!target) return prev;
@@ -137,11 +136,20 @@ export default function App() {
   }
 
   function addSite() {
-    setFormError(null)
-    setSites([...sites, { id: newId.trim(), x: Number(newX), y: Number(newY) }])
-    setNewId('')
-    setNewX('')
-    setNewY('')
+    const id = newId.trim();
+    const x = Number(newX);
+    const y = Number(newY);
+    const next = [...sites, { id, x, y }];
+    const errs = validateConfig({ width, height, sites: next });
+    if (errs.length > 0) {
+      setFormError(errs[0]);
+      return;
+    }
+    setFormError(null);
+    setSites(next);
+    setNewId('');
+    setNewX('');
+    setNewY('');
   }
 
   function removeSite(id: string) {
@@ -331,7 +339,42 @@ export default function App() {
           {queryResult && (
             <section className="panel query-panel">
               <h2>边界查询</h2>
-              <p className="winner">命中站点：<strong>{queryResult.winnerId}</strong></p>
+              <p className="query-point">
+                查询点：<code>{pointToString(queryResult.point)}</code>
+                <br />
+                <span className="muted">
+                  ≈ ({fracText(queryResult.point.x, 6)}, {fracText(queryResult.point.y, 6)})
+                </span>
+              </p>
+              <p className="winner">
+                命中站点：<strong>{queryResult.winnerId}</strong>
+                {queryResult.tied && (
+                  <span className="tie-badge">
+                    等距：{queryResult.ties.join('、')}（按 id 字节序取胜）
+                  </span>
+                )}
+              </p>
+              <table className="evidence">
+                <thead>
+                  <tr>
+                    <th>站点</th>
+                    <th>精确平方距离</th>
+                    <th>≈</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {queryResult.entries.map((entry) => (
+                    <tr
+                      key={entry.id}
+                      className={entry.id === queryResult.winnerId ? 'row-winner' : ''}
+                    >
+                      <td>{entry.id}</td>
+                      <td className="mono">{fractionToString(entry.d2)}</td>
+                      <td className="mono">{fractionToRounded(entry.d2, 4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </section>
           )}
 
@@ -364,6 +407,42 @@ export default function App() {
                     {cell && (
                       <div className="cell-body">
                         <p>精确面积：<code>{fracText(cell.area, 3)}</code></p>
+                        <p>
+                          邻接站点（共享正长度边段）：
+                          {cell.neighbors.length === 0 && <span className="muted">无</span>}
+                          {cell.neighbors.map((nId) => (
+                            <button
+                              key={nId}
+                              className="neighbor-chip"
+                              onClick={() => setSelectedId(nId)}
+                            >
+                              {nId}
+                            </button>
+                          ))}
+                        </p>
+                        <p>顶点（{cell.polygon.length}，精确分数）：</p>
+                        <ul className="vertex-list">
+                          {cell.polygon.map((p, vi) => (
+                            <li key={vi} className="mono">
+                              v{vi + 1} {pointToString(p)} ≈ ({fractionToRounded(p.x, 3)}, {fractionToRounded(p.y, 3)})
+                            </li>
+                          ))}
+                        </ul>
+                        <p>边与邻接证据：</p>
+                        <ul className="edge-list">
+                          {cell.edges.map((edge, ei) => (
+                            <li key={ei}>
+                              {edge.kind === 'bisector' ? (
+                                <span className="tag tag-bis">等分线 ↔ {edge.neighbor}</span>
+                              ) : (
+                                <span className="tag tag-bnd">矩形边界</span>
+                              )}{' '}
+                              <span className="mono">
+                                {pointToString(edge.p1)} → {pointToString(edge.p2)}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
                       </div>
                     )}
                   </li>

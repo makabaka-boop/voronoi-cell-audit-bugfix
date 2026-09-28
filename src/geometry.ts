@@ -99,8 +99,29 @@ export const fr = (v: bigint | number): Fraction => frac(v);
  * 进入精确计算管线；例如 0.1 得到其真实二进制近似而非十进制的 1/10。
  */
 export function fractionFromNumber(v: number): Fraction {
-  if (!Number.isFinite(v)) throw new Error('not a finite number: ' + v)
-  return frac(BigInt(Math.round(v * 1000)), 1000n)
+  if (!Number.isFinite(v)) throw new Error('not a finite number: ' + v);
+  if (v === 0) return frac(0n); // 含 -0
+  // 直接解码 IEEE-754 双精度 64 位位模式：
+  // 规格化数 value = m·2^e（m 含隐含前导 1，e = exp - 1075）
+  // 非规格化数 value = m·2^-1074
+  const dv = new DataView(new ArrayBuffer(8));
+  dv.setFloat64(0, v, false); // 大端
+  let bits = 0n;
+  for (let i = 0; i < 8; i++) bits = (bits << 8n) | BigInt(dv.getUint8(i));
+  const negative = (bits >> 63n) === 1n;
+  const exp = Number((bits >> 52n) & 0x7ffn);
+  const mant = bits & ((1n << 52n) - 1n);
+  let m: bigint;
+  let e: number;
+  if (exp === 0) {
+    m = mant;
+    e = -1074;
+  } else {
+    m = mant | (1n << 52n);
+    e = exp - 1075;
+  }
+  if (negative) m = -m;
+  return e >= 0 ? frac(m * (1n << BigInt(e))) : frac(m, 1n << BigInt(-e));
 }
 
 export const fadd = (x: Fraction, y: Fraction): Fraction =>
@@ -218,9 +239,28 @@ export function removeConsecutiveDupes(poly: Point[]): Point[] {
   return pts;
 }
 
-/** 反复剔除落在相邻两点连线上的中间顶点，直到稳定 */
+/** 反复剔除落在相邻两点连线上的中间顶点，直到稳定（精确叉积判定） */
 export function removeCollinear(poly: Point[]): Point[] {
-  return removeConsecutiveDupes(poly)
+  let pts = removeConsecutiveDupes(poly);
+  if (pts.length < 3) return pts;
+  let changed = true;
+  while (changed && pts.length >= 3) {
+    changed = false;
+    const out: Point[] = [];
+    for (let i = 0; i < pts.length; i++) {
+      const prev = pts[(i + pts.length - 1) % pts.length];
+      const cur = pts[i];
+      const next = pts[(i + 1) % pts.length];
+      // 裁切得到的是凸多边形，叉积为 0 的中间顶点必在相邻线段上，直接剔除
+      if (fcmp(cross(prev, cur, next), frac(0n)) === 0) {
+        changed = true;
+        continue;
+      }
+      out.push(cur);
+    }
+    pts = removeConsecutiveDupes(out);
+  }
+  return pts;
 }
 
 // ---------- 单元 / 邻接 / 面积 ----------
@@ -242,8 +282,9 @@ function polygonArea(poly: Point[]): Fraction {
     const q = poly[(i + 1) % poly.length];
     sum = fadd(sum, fsub(fmul(p.x, q.y), fmul(q.x, p.y)));
   }
+  // 鞋带公式给出的是两倍有向面积；取绝对值再除以 2
   const twice = sum.n < 0n ? fneg(sum) : sum;
-  return twice;
+  return fdiv(twice, frac(2n));
 }
 
 /** id 的字节序（ASCII 站点按字节比较即代码点顺序）；浏览器环境用 TextEncoder */
@@ -283,16 +324,15 @@ export function computeCells(cfg: ValidConfig): Cell[] {
       for (const t of sites) {
         if (t.id === s.id) continue;
         const pln = bisectorPlane(s, t);
-        // 边段两个端点都在等距线上 ⇒ 整条正长度边段属于该等分线
+        // 边段两个端点都在等距线上 ⇒ 整条正长度边段属于该等分线；
+        // 只有一个端点在等距线上只是“顶点接触”，不算邻接
         if (
-          fcmp(evalPlane(pln, p1), frac(0n)) === 0 ||
+          fcmp(evalPlane(pln, p1), frac(0n)) === 0 &&
           fcmp(evalPlane(pln, p2), frac(0n)) === 0
         ) {
-          if (kind === 'bisector') {
-            continue;
-          }
           kind = 'bisector';
           neighbor = t.id;
+          break;
         }
       }
       edges.push({ p1, p2, kind, neighbor });
@@ -320,7 +360,7 @@ export function nearestSite(cfg: ValidConfig, p: Point): QueryResult {
   });
   entries.sort((a, b) => {
     const c = fcmp(a.d2, b.d2);
-    return c !== 0 ? c : compareId(b.id, a.id);
+    return c !== 0 ? c : compareId(a.id, b.id); // 等距时 id 字节序小者胜
   });
   const best = entries[0].d2;
   const ties = entries.filter((e) => feq(e.d2, best)).map((e) => e.id);
@@ -348,9 +388,34 @@ export function isAsciiId(id: string): boolean {
 /** 返回错误列表（中文）；空数组表示配置合法 */
 export function validateConfig(cfg: ConfigInput): string[] {
   const errors: string[] = []
-  if (cfg.width < 100 || cfg.width > 1000) errors.push('宽度必须是 100～1000 的整数')
-  if (cfg.height < 100 || cfg.height > 1000) errors.push('高度必须是 100～1000 的整数')
+  if (!Number.isInteger(cfg.width) || cfg.width < 100 || cfg.width > 1000) {
+    errors.push('宽度必须是 100～1000 的整数')
+  }
+  if (!Number.isInteger(cfg.height) || cfg.height < 100 || cfg.height > 1000) {
+    errors.push('高度必须是 100～1000 的整数')
+  }
   if (cfg.sites.length < 2 || cfg.sites.length > 30) errors.push('站点数必须为 2～30 个')
+
+  const seenIds = new Set<string>();
+  const seenCoords = new Set<string>();
+  cfg.sites.forEach((s, i) => {
+    if (!isAsciiId(s.id)) {
+      errors.push(`站点 ${i + 1} 的 id 必须是非空可打印 ASCII（不含空白）`)
+    } else if (seenIds.has(s.id)) {
+      errors.push(`站点 id 重复：${s.id}`)
+    } else {
+      seenIds.add(s.id)
+    }
+    if (!Number.isInteger(s.x) || !Number.isInteger(s.y)) {
+      errors.push(`站点 ${s.id || i + 1} 的坐标必须是整数`)
+    } else if (s.x < 0 || s.x > cfg.width || s.y < 0 || s.y > cfg.height) {
+      errors.push(`站点 ${s.id || i + 1} 的坐标 (${s.x}, ${s.y}) 超出区域 [0,${cfg.width}]×[0,${cfg.height}]`)
+    } else {
+      const key = `${s.x},${s.y}`
+      if (seenCoords.has(key)) errors.push(`站点坐标重合：(${s.x}, ${s.y})`)
+      else seenCoords.add(key)
+    }
+  })
   return errors
 }
 
@@ -375,9 +440,22 @@ export function fractionToNumber(f: Fraction): number {
   return Number(f.n) / Number(f.d);
 }
 
-/** 四舍五入到 dp 位小数（精确分数实现），返回字符串 */
+/** 四舍五入到 dp 位小数（精确 bigint 有理数实现，不经过 double），返回字符串 */
 export function fractionToRounded(f: Fraction, dp = 3): string {
-  return (Number(f.n) / Number(f.d)).toFixed(dp)
+  const scale = 10n ** BigInt(dp);
+  let q = (f.n * scale) / f.d;
+  const r = (f.n * scale) % f.d; // f.d 恒正，故 r 与 f.n 同号
+  // 半数进位（远离零方向）
+  if (r !== 0n && (r < 0n ? -r * 2n >= f.d : r * 2n >= f.d)) {
+    q += f.n < 0n ? -1n : 1n;
+  }
+  const neg = q < 0n;
+  if (neg) q = -q;
+  if (dp === 0) return neg ? `-${q}` : `${q}`;
+  const whole = q / scale;
+  let fracPart = (q % scale).toString();
+  if (fracPart.length < dp) fracPart = fracPart.padStart(dp, '0');
+  return `${neg ? '-' : ''}${whole}.${fracPart}`;
 }
 
 export function pointToString(p: Point): string {
