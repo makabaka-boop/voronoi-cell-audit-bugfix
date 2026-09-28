@@ -99,8 +99,29 @@ export const fr = (v: bigint | number): Fraction => frac(v);
  * 进入精确计算管线；例如 0.1 得到其真实二进制近似而非十进制的 1/10。
  */
 export function fractionFromNumber(v: number): Fraction {
-  if (!Number.isFinite(v)) throw new Error('not a finite number: ' + v)
-  return frac(BigInt(Math.round(v * 1000)), 1000n)
+  if (!Number.isFinite(v)) throw new Error('not a finite number: ' + v);
+  if (v === 0) return frac(0n); // ±0 都规范化为 0
+  const dv = new DataView(new ArrayBuffer(8));
+  dv.setFloat64(0, v, false); // 大端序：符号位在最高位
+  let raw = 0n;
+  for (let i = 0; i < 8; i++) raw = (raw << 8n) | BigInt(dv.getUint8(i));
+  const sign = raw >> 63n;
+  const exp = Number((raw >> 52n) & 0x7ffn);
+  const mant = raw & ((1n << 52n) - 1n);
+  let num: bigint;
+  let denExp: number; // |v| = num / 2^denExp
+  if (exp === 0) {
+    // 非规格化：value = (-1)^s · 2^-1022 · (mantissa/2^52) = mantissa / 2^1074
+    num = mant;
+    denExp = 1074;
+  } else {
+    // 规格化：value = (-1)^s · 2^(e-1023) · (1 + mantissa/2^52)
+    num = (1n << 52n) | mant;
+    denExp = 1075 - exp; // 1023 + 52
+  }
+  if (sign) num = -num;
+  if (denExp <= 0) return frac(num << BigInt(-denExp));
+  return frac(num, 1n << BigInt(denExp));
 }
 
 export const fadd = (x: Fraction, y: Fraction): Fraction =>
@@ -218,9 +239,23 @@ export function removeConsecutiveDupes(poly: Point[]): Point[] {
   return pts;
 }
 
-/** 反复剔除落在相邻两点连线上的中间顶点，直到稳定 */
+/** 反复剔除落在相邻两点连线上的中间顶点（精确叉积为 0），直到稳定 */
 export function removeCollinear(poly: Point[]): Point[] {
-  return removeConsecutiveDupes(poly)
+  let pts = removeConsecutiveDupes(poly);
+  for (;;) {
+    if (pts.length < 3) return pts;
+    const next: Point[] = [];
+    for (let i = 0; i < pts.length; i++) {
+      const prev = pts[(i + pts.length - 1) % pts.length];
+      const cur = pts[i];
+      const succ = pts[(i + 1) % pts.length];
+      if (fcmp(cross(prev, cur, succ), frac(0n)) === 0) continue; // 共线中间点，剔除
+      next.push(cur);
+    }
+    const out = removeConsecutiveDupes(next);
+    if (out.length === pts.length) return out; // 已稳定
+    pts = out;
+  }
 }
 
 // ---------- 单元 / 邻接 / 面积 ----------
@@ -243,7 +278,7 @@ function polygonArea(poly: Point[]): Fraction {
     sum = fadd(sum, fsub(fmul(p.x, q.y), fmul(q.x, p.y)));
   }
   const twice = sum.n < 0n ? fneg(sum) : sum;
-  return twice;
+  return fdiv(twice, frac(2n)); // 鞋带公式给出的是二倍面积
 }
 
 /** id 的字节序（ASCII 站点按字节比较即代码点顺序）；浏览器环境用 TextEncoder */
@@ -283,16 +318,15 @@ export function computeCells(cfg: ValidConfig): Cell[] {
       for (const t of sites) {
         if (t.id === s.id) continue;
         const pln = bisectorPlane(s, t);
-        // 边段两个端点都在等距线上 ⇒ 整条正长度边段属于该等分线
+        // 边段两个端点都在等距线上 ⇒ 整条正长度边段属于该等分线；
+        // 只在一个顶点接触（叉点重合）不算邻接。
         if (
-          fcmp(evalPlane(pln, p1), frac(0n)) === 0 ||
+          fcmp(evalPlane(pln, p1), frac(0n)) === 0 &&
           fcmp(evalPlane(pln, p2), frac(0n)) === 0
         ) {
-          if (kind === 'bisector') {
-            continue;
-          }
           kind = 'bisector';
           neighbor = t.id;
+          break;
         }
       }
       edges.push({ p1, p2, kind, neighbor });
@@ -320,10 +354,13 @@ export function nearestSite(cfg: ValidConfig, p: Point): QueryResult {
   });
   entries.sort((a, b) => {
     const c = fcmp(a.d2, b.d2);
-    return c !== 0 ? c : compareId(b.id, a.id);
+    return c !== 0 ? c : compareId(a.id, b.id); // 等距时 id 字节序小者在前
   });
   const best = entries[0].d2;
-  const ties = entries.filter((e) => feq(e.d2, best)).map((e) => e.id);
+  const ties = entries
+    .filter((e) => feq(e.d2, best))
+    .map((e) => e.id)
+    .sort(compareId);
   return { point: p, winnerId: entries[0].id, tied: ties.length > 1, ties, entries };
 }
 
@@ -347,11 +384,40 @@ export function isAsciiId(id: string): boolean {
 
 /** 返回错误列表（中文）；空数组表示配置合法 */
 export function validateConfig(cfg: ConfigInput): string[] {
-  const errors: string[] = []
-  if (cfg.width < 100 || cfg.width > 1000) errors.push('宽度必须是 100～1000 的整数')
-  if (cfg.height < 100 || cfg.height > 1000) errors.push('高度必须是 100～1000 的整数')
-  if (cfg.sites.length < 2 || cfg.sites.length > 30) errors.push('站点数必须为 2～30 个')
-  return errors
+  const errors: string[] = [];
+  if (!Number.isInteger(cfg.width) || cfg.width < 100 || cfg.width > 1000)
+    errors.push('宽度必须是 100～1000 的整数');
+  if (!Number.isInteger(cfg.height) || cfg.height < 100 || cfg.height > 1000)
+    errors.push('高度必须是 100～1000 的整数');
+  if (cfg.sites.length < 2 || cfg.sites.length > 30)
+    errors.push('站点数必须为 2～30 个');
+
+  const idSeen = new Set<string>();
+  const coordSeen = new Set<string>();
+  cfg.sites.forEach((s, i) => {
+    const label = `第 ${i + 1} 个站点`;
+    if (!isAsciiId(s.id)) {
+      errors.push(`${label} id 必须为非空可打印 ASCII（不含空白）`);
+    } else if (idSeen.has(s.id)) {
+      errors.push(`站点 id 重复：${s.id}`);
+    } else {
+      idSeen.add(s.id);
+    }
+    if (!Number.isInteger(s.x) || !Number.isInteger(s.y)) {
+      errors.push(`${label}${isAsciiId(s.id) ? `（${s.id}）` : ''}坐标必须为整数`);
+      return;
+    }
+    if (s.x < 0 || s.x > cfg.width || s.y < 0 || s.y > cfg.height) {
+      errors.push(`${label}（${s.id}）坐标 (${s.x}, ${s.y}) 越界，须在 [0,${cfg.width}]×[0,${cfg.height}] 内`);
+    }
+    const key = `${s.x},${s.y}`;
+    if (coordSeen.has(key)) {
+      errors.push(`站点坐标重合：(${s.x}, ${s.y})`);
+    } else {
+      coordSeen.add(key);
+    }
+  });
+  return errors;
 }
 
 export function toValidConfig(cfg: ConfigInput): ValidConfig {
@@ -375,9 +441,23 @@ export function fractionToNumber(f: Fraction): number {
   return Number(f.n) / Number(f.d);
 }
 
-/** 四舍五入到 dp 位小数（精确分数实现），返回字符串 */
+/** 四舍五入到 dp 位小数（精确分数实现，half away from zero），返回字符串 */
 export function fractionToRounded(f: Fraction, dp = 3): string {
-  return (Number(f.n) / Number(f.d)).toFixed(dp)
+  const scale = 10n ** BigInt(dp);
+  const scaled = f.n * scale;
+  const q = scaled / f.d;
+  const r = scaled % f.d; // 与分子同号
+  let rounded = q;
+  // 余数绝对值是否达到分母的一半
+  if (r !== 0n && (r < 0n ? -r : r) * 2n >= f.d) {
+    rounded += f.n < 0n ? -1n : 1n;
+  }
+  if (dp === 0) return rounded.toString();
+  const neg = rounded < 0n;
+  const digits = (neg ? -rounded : rounded).toString().padStart(dp + 1, '0');
+  const intPart = digits.slice(0, digits.length - dp);
+  const fracPart = digits.slice(digits.length - dp);
+  return `${neg && rounded !== 0n ? '-' : ''}${intPart}.${fracPart}`;
 }
 
 export function pointToString(p: Point): string {

@@ -7,11 +7,14 @@ import {
   Site,
   ValidConfig,
   computeCells,
+  fadd,
+  frac,
   fractionFromNumber,
   fractionToNumber,
   fractionToRounded,
   fractionToString,
   nearestSite,
+  pointToString,
   toValidConfig,
   validateConfig,
 } from './geometry';
@@ -87,11 +90,16 @@ export default function App() {
   }, [model]);
 
   /** 浏览器事件坐标 → viewBox 逻辑坐标（double），与 SVG 缩放方式无关 */
-  function toLogical(clientX: number, clientY: number): Point {
+  function clientToLogical(clientX: number, clientY: number): { x: number; y: number } {
     const svg = svgRef.current!;
     const ctm = svg.getScreenCTM();
     if (!ctm) throw new Error('SVG CTM 不可用');
     const loc = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse());
+    return { x: loc.x, y: loc.y };
+  }
+
+  function toLogical(clientX: number, clientY: number): Point {
+    const loc = clientToLogical(clientX, clientY);
     return { x: fractionFromNumber(loc.x), y: fractionFromNumber(loc.y) };
   }
 
@@ -99,7 +107,8 @@ export default function App() {
     Math.max(lo, Math.min(hi, Math.round(v)));
 
   function onCanvasPointerDown(e: React.PointerEvent) {
-    if (e.target !== e.currentTarget) return; // 点到站点标记交给标记处理
+    // 点到站点标记交给标记处理（其 onPointerDown 已 stopPropagation）；
+    // 点到单元多边形/边线/空白都应得到一次完整查询。
     setQuery(toLogical(e.clientX, e.clientY));
     setSelectedId(null);
   }
@@ -118,7 +127,8 @@ export default function App() {
     if (!svg) return;
     const ctm = svg.getScreenCTM();
     if (!ctm) return;
-    const loc = { x: e.clientX, y: e.clientY };
+    // 先经逆 CTM 还原到 viewBox 逻辑坐标再取整，缩放/留白不改变落点
+    const loc = clientToLogical(e.clientX, e.clientY);
     const nx = clampInt(loc.x, 0, width);
     const ny = clampInt(loc.y, 0, height);
     setSites((prev) => {
@@ -137,11 +147,40 @@ export default function App() {
   }
 
   function addSite() {
-    setFormError(null)
-    setSites([...sites, { id: newId.trim(), x: Number(newX), y: Number(newY) }])
-    setNewId('')
-    setNewX('')
-    setNewY('')
+    setFormError(null);
+    const id = newId.trim();
+    const x = Number(newX);
+    const y = Number(newY);
+    // 本地预检（完整规则复用 validateConfig），非法站点绝不进入状态
+    if (!id) {
+      setFormError('id 不能为空');
+      return;
+    }
+    if (!Number.isFinite(x) || !Number.isFinite(y) ||
+      !Number.isInteger(x) || !Number.isInteger(y)) {
+      setFormError('坐标必须填写整数');
+      return;
+    }
+    if (x < 0 || x > width || y < 0 || y > height) {
+      setFormError(`坐标须在 [0,${width}]×[0,${height}] 内`);
+      return;
+    }
+    if (sites.some((s) => s.id === id)) {
+      setFormError(`id 已存在：${id}`);
+      return;
+    }
+    if (sites.some((s) => s.x === x && s.y === y)) {
+      setFormError(`坐标 (${x}, ${y}) 已被其它站点占用`);
+      return;
+    }
+    if (sites.length >= 30) {
+      setFormError('站点数不能超过 30');
+      return;
+    }
+    setSites([...sites, { id, x, y }]);
+    setNewId('');
+    setNewX('');
+    setNewY('');
   }
 
   function removeSite(id: string) {
@@ -331,12 +370,59 @@ export default function App() {
           {queryResult && (
             <section className="panel query-panel">
               <h2>边界查询</h2>
-              <p className="winner">命中站点：<strong>{queryResult.winnerId}</strong></p>
+              <p className="query-point">
+                查询点：<code>{pointToString(queryResult.point)}</code>
+                <br />
+                <span className="muted">
+                  ≈ ({fractionToRounded(queryResult.point.x, 4)},{' '}
+                  {fractionToRounded(queryResult.point.y, 4)})
+                </span>
+              </p>
+              <p className="winner">
+                命中站点：<strong>{queryResult.winnerId}</strong>
+                {queryResult.tied && (
+                  <span className="tie-badge">
+                    等距决胜：{queryResult.ties.join(' = ')}（按 id 字节序取胜）
+                  </span>
+                )}
+              </p>
+              <table className="evidence">
+                <thead>
+                  <tr>
+                    <th>站点</th>
+                    <th>精确平方距离 d²</th>
+                    <th>≈</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {queryResult.entries.map((e) => (
+                    <tr
+                      key={e.id}
+                      className={e.id === queryResult.winnerId ? 'row-winner' : ''}
+                    >
+                      <td>{e.id}</td>
+                      <td className="mono">{fractionToString(e.d2)}</td>
+                      <td className="mono muted">{fractionToRounded(e.d2, 4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </section>
           )}
 
           <section className="panel">
             <h2>站点与单元（{sites.length}）</h2>
+            {model && (
+              <p className="muted">
+                单元面积合计：
+                <code>
+                  {fractionToString(
+                    model.cells.reduce((acc, c) => fadd(acc, c.area), frac(0n)),
+                  )}
+                </code>
+                {' '}/ 区域面积 <code>{width * height}</code>
+              </p>
+            )}
             {!model && <p className="muted">配置合法后显示计算结果。</p>}
             <ul className="cell-list">
               {sites.map((s, i) => {
@@ -364,6 +450,54 @@ export default function App() {
                     {cell && (
                       <div className="cell-body">
                         <p>精确面积：<code>{fracText(cell.area, 3)}</code></p>
+                        <p>
+                          邻接站点（共享正长度边段）：
+                          {cell.neighbors.length === 0 && <span className="muted">无</span>}
+                          {cell.neighbors.map((n) => (
+                            <button
+                              key={n}
+                              className="neighbor-chip"
+                              onClick={() => setSelectedId(n)}
+                            >
+                              {n}
+                            </button>
+                          ))}
+                        </p>
+                        {active && (
+                          <>
+                            <p>顶点（精确分数，共 {cell.polygon.length} 个）：</p>
+                            <ol className="vertex-list">
+                              {cell.polygon.map((p, vi) => (
+                                <li key={vi} className="mono">
+                                  V{vi} {pointToString(p)}{' '}
+                                  <span className="muted">≈ ({fractionToRounded(p.x, 3)}, {fractionToRounded(p.y, 3)})</span>
+                                </li>
+                              ))}
+                            </ol>
+                            <p>邻接边 / 边界边证据：</p>
+                            <ul className="edge-list">
+                              {cell.edges.map((edge, ei) => {
+                                const v1 = cell.polygon.findIndex(
+                                  (p) => p === edge.p1,
+                                );
+                                const v2 = cell.polygon.findIndex(
+                                  (p) => p === edge.p2,
+                                );
+                                return (
+                                  <li key={ei} className="mono">
+                                    {edge.kind === 'bisector' ? (
+                                      <span className="tag tag-bis">等分线 ↔ {edge.neighbor}</span>
+                                    ) : (
+                                      <span className="tag tag-bnd">矩形边界</span>
+                                    )}{' '}
+                                    V{v1} {pointToString(edge.p1)} → V{v2}{' '}
+                                    {pointToString(edge.p2)}
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </>
+                        )}
                       </div>
                     )}
                   </li>
